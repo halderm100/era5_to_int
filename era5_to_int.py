@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+G_ECMWF = 9.80665
+ERA5_TO_INT_VERSION = '2026-06-06-rhfix-liquid-landsea-levelorder'
+
+
 class SnowDiags:
     """ Implements the computation of SNOW (water equivalent snow depth) and
     SNOWH (physical snow depth) from ERA5 RSN (water equivalent snow depth)
@@ -154,6 +158,73 @@ class RHDiags:
           del self.savefields[('q', xlvl)]
 
 
+class DirectRHToLiquidDiags:
+    """Adjusts direct ERA5 pressure-level RH to the same liquid-water
+    convention used by WPS/ungrib for ECMWF pressure-level RH.
+
+    WPS ungrib applies fix_gfs_rh to ECMWF RH records. That routine converts
+    RH that is referenced to ice/mixed phase at sub-freezing temperatures into
+    RH referenced to liquid water, which is what real.exe assumes. This class
+    reproduces that adjustment for the netCDF-to-intermediate workflow.
+    """
+
+    def __init__(self):
+        self.savefields = {}
+
+    def _to_liquid_water_rh(self, rh, tt):
+        import numpy as np
+
+        rh_out = np.ma.array(rh, copy=True)
+        tt_ma = np.ma.asarray(tt)
+
+        cold = tt_ma <= 273.15
+        if not np.ma.any(cold):
+            return rh_out
+
+        # Same equations as WPS/ungrib/src/rrpr.F:fix_gfs_rh.
+        # eis and ews are in hPa.
+        eis = 0.01 * np.ma.exp(
+            9.550426 - (5723.265 / tt_ma) +
+            (3.53068 * np.ma.log(tt_ma)) -
+            (0.00728332 * tt_ma)
+        )
+        ews = 6.112 * np.ma.exp(
+            17.67 * (tt_ma - 273.15) / ((tt_ma - 273.15) + 243.5)
+        )
+
+        blend = (273.15 - tt_ma) / 20.0
+        r_mixed = (blend * eis) + ((1.0 - blend) * ews)
+        r = np.ma.where(tt_ma > 253.15, r_mixed, eis)
+
+        rh_out = np.ma.where(cold, rh_out * (r / ews), rh_out)
+        return rh_out
+
+    def consider(self, field, xlvl, proj, hdate, slab, intfile):
+        if xlvl == 200100.0:
+            return
+
+        if field == 'RH':
+            self.savefields[('rh', xlvl)] = slab
+        elif field == 'TT':
+            self.savefields[('tt', xlvl)] = slab
+        else:
+            return
+
+        if ('rh', xlvl) in self.savefields and ('tt', xlvl) in self.savefields:
+            print('Adjusting RH to liquid-water convention at ' + str(xlvl))
+            rh_liq = self._to_liquid_water_rh(
+                self.savefields[('rh', xlvl)],
+                self.savefields[('tt', xlvl)]
+            )
+
+            write_slab(intfile, rh_liq, xlvl, proj, 'RH', hdate, '%',
+                'ERA5 reanalysis grid',
+                'Relative humidity adjusted to liquid-water convention')
+
+            del self.savefields[('rh', xlvl)]
+            del self.savefields[('tt', xlvl)]
+
+
 class GeopotentialHeightDiags:
     """ Implements the computation of SOILHGT and GHT (geopotential height at
     the surface and at upper-air levels, respectively) from ERA5 Z
@@ -170,13 +241,13 @@ class GeopotentialHeightDiags:
         if field == 'GEOPT':
             print('Computing GHT at ', xlvl)
 
-            write_slab(intfile, slab / 9.81, xlvl, proj, 'GHT', hdate, 'm',
+            write_slab(intfile, slab / G_ECMWF, xlvl, proj, 'GHT', hdate, 'm',
                 'ERA5 reanalysis grid', 'Geopotential height')
 
         elif field == 'SOILGEO':
             print('Computing SOILHGT')
 
-            write_slab(intfile, slab / 9.81, 200100.0, proj, 'SOILHGT', hdate, 'm',
+            write_slab(intfile, slab / G_ECMWF, 200100.0, proj, 'SOILHGT', hdate, 'm',
                 'ERA5 reanalysis grid', 'Geopotential height')
 
         else:
@@ -202,7 +273,7 @@ class ModelLevelPresGhtDiags:
         import numpy as np
 
         if field == 'SOILGEO':
-            self.savefields['hgtsfc'] = slab / 9.81
+            self.savefields['hgtsfc'] = slab / G_ECMWF
         elif field == 'PSFC':
             self.savefields['psfc'] = slab
         elif field == 'TT' and xlvl != 200100.0:
@@ -258,7 +329,7 @@ class ModelLevelPresGhtDiags:
 
                 # Compute virtual temperature
                 tv = 287.05 * tt_half * (1.0 + 0.61 * q_half)
-                hgtprev = hgtprev + tv * np.log(pres_start / pres) / 9.81
+                hgtprev = hgtprev + tv * np.log(pres_start / pres) / G_ECMWF
 
                 write_slab(intfile, pres, level, proj, 'PRESSURE', hdate, 'Pa', 'ERA5 reanalysis grid', '3-d pressure')
                 write_slab(intfile, hgtprev, level, proj, 'GHT', hdate, 'm', 'ERA5 reanalysis grid', '3-d geopotential height')
@@ -533,6 +604,21 @@ def handle_datetime_args(args):
     return startDate, endDate, intvH
 
 
+# Fields that are physically meaningful only over land or water. Masking these
+# before writing the intermediate file makes behavior closer to GRIB fields with
+# bitmaps and reduces coastline artifacts in metgrid output comparisons.
+LAND_ONLY_FIELDS = {
+    'SM000007', 'SM007028', 'SM028100', 'SM100289',
+    'ST000007', 'ST007028', 'ST100289', 'ST028100',
+    'SNOW_DEN', 'SNOW_EC'
+}
+
+WATER_ONLY_FIELDS = {
+    'SST', 'SEAICE'
+}
+
+
+
 if __name__ == '__main__':
     from netCDF4 import Dataset
     import numpy as np
@@ -540,6 +626,7 @@ if __name__ == '__main__':
     import argparse
     import datetime
     import sys
+    import os
 
     parser = argparse.ArgumentParser()
     parser.add_argument('datetime', help='the date-time to convert in YYYY-MM-DD_HH format')
@@ -548,6 +635,13 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--path', help='the local path to search for ERA5 netCDF files')
     parser.add_argument('-i', '--isobaric', action='store_true', help='use ERA5 pressure-level data rather than model-level data')
     parser.add_argument('-v', '--variables', help='a comma-separated list, without spaces, of WPS variable names to process')
+    parser.add_argument('-o', '--output-dir', default='.',
+        help='directory where WPS intermediate files will be written')
+    parser.add_argument('--binary-landsea', action='store_true',
+        help='threshold ERA5 fractional LSM to 0/1 before writing LANDSEA; use this only if the reference GRIB/ungrib met_em LANDSEA is binary')
+    parser.add_argument('--level-order', choices=['as_file', 'top_to_bottom', 'bottom_to_top'],
+        default='as_file',
+        help='order for pressure-level output records in isobaric mode; use bottom_to_top if the GRIB/ungrib met_em has pressure levels in 1000 hPa -> 1 hPa order')
     args = parser.parse_args()
 
     try:
@@ -556,9 +650,17 @@ if __name__ == '__main__':
         print('Error in argument list: ' + e.args[0])
         sys.exit(1)
 
+    print('ERA5_TO_INT_VERSION =', ERA5_TO_INT_VERSION)
     print('datetime = ', startDate)
     print('until_datetime = ', endDate)
     print('interval_hours = ', intvH)
+
+    output_dir = os.path.abspath(args.output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    output_prefix = os.path.join(output_dir, 'ERA5')
+
+    print('output_dir = ', output_dir)
+    print('output_prefix = ', output_prefix)
 
     # Set up the two map projections used in the ERA5 fields to be converted
     Gaussian = MapProjection(WPSUtils.Projections.GAUSS,
@@ -571,19 +673,35 @@ if __name__ == '__main__':
     diagnostics.append(RH2mDiags())
     diagnostics.append(GeopotentialHeightDiags())
 
+    # In pressure-level mode, read ERA5 relative humidity directly from R,
+    # but adjust it to the liquid-water RH convention used by WPS/ungrib for
+    # ECMWF data. This is needed to match Copernicus GRIB -> ungrib output.
     if args.isobaric:
-        diagnostics.append(RHDiags())
+        diagnostics.append(DirectRHToLiquidDiags())
     else:
         coeffs = np.loadtxt('./ecmwf_coeffs', usecols=(1,2))
         diagnostics.append(ModelLevelPresGhtDiags(coeffs[:,0], coeffs[:,1]))
 
     int_vars = []
     if args.isobaric:
-        int_vars.append(MetVar('GEOPT', 'Z', 'e5.oper.an.pl.128_129_z.ll025sc.{}_{}.nc', begin_daily, end_daily, LatLon))
-        int_vars.append(MetVar('SPECHUMD', 'Q', 'e5.oper.an.pl.128_133_q.ll025sc.{}_{}.nc', begin_daily, end_daily, LatLon))
-        int_vars.append(MetVar('TT', 'T', 'e5.oper.an.pl.128_130_t.ll025sc.{}_{}.nc', begin_daily, end_daily, LatLon))
-        int_vars.append(MetVar('UU', 'U', 'e5.oper.an.pl.128_131_u.ll025uv.{}_{}.nc', begin_daily, end_daily, LatLon))
-        int_vars.append(MetVar('VV', 'V', 'e5.oper.an.pl.128_132_v.ll025uv.{}_{}.nc', begin_daily, end_daily, LatLon))
+        int_vars.append(MetVar('GEOPT', 'Z',
+            'e5.oper.an.pl.128_129_z.ll025sc.{}_{}.nc',
+            begin_daily, end_daily, LatLon))
+        int_vars.append(MetVar('SPECHUMD', 'Q',
+            'e5.oper.an.pl.128_133_q.ll025sc.{}_{}.nc',
+            begin_daily, end_daily, LatLon))
+        int_vars.append(MetVar('RH', 'R',
+            'e5.oper.an.pl.128_157_r.ll025sc.{}_{}.nc',
+            begin_daily, end_daily, LatLon))
+        int_vars.append(MetVar('TT', 'T',
+            'e5.oper.an.pl.128_130_t.ll025sc.{}_{}.nc',
+            begin_daily, end_daily, LatLon))
+        int_vars.append(MetVar('UU', 'U',
+            'e5.oper.an.pl.128_131_u.ll025uv.{}_{}.nc',
+            begin_daily, end_daily, LatLon))
+        int_vars.append(MetVar('VV', 'V',
+            'e5.oper.an.pl.128_132_v.ll025uv.{}_{}.nc',
+            begin_daily, end_daily, LatLon))
     else:
         int_vars.append(MetVar('SPECHUMD', 'Q', 'e5.oper.an.ml.0_5_0_1_0_q.regn320sc.{}_{}.nc', begin_6hourly, end_6hourly, Gaussian))
         int_vars.append(MetVar('TT', 'T', 'e5.oper.an.ml.0_5_0_0_0_t.regn320sc.{}_{}.nc', begin_6hourly, end_6hourly, Gaussian))
@@ -608,8 +726,26 @@ if __name__ == '__main__':
     int_vars.append(MetVar('SNOW_DEN', 'RSN', 'e5.oper.an.sfc.128_033_rsn.ll025sc.{}_{}.nc', begin_monthly, end_monthly, LatLon))
     int_vars.append(MetVar('SNOW_EC', 'SD', 'e5.oper.an.sfc.128_141_sd.ll025sc.{}_{}.nc', begin_monthly, end_monthly, LatLon))
     int_vars.append(MetVar('PMSL', 'MSL', 'e5.oper.an.sfc.128_151_msl.ll025sc.{}_{}.nc', begin_monthly, end_monthly, LatLon))
-    int_vars.append(MetVar('PSFC', 'SP', 'e5.oper.an.ml.128_134_sp.regn320sc.{}_{}.nc', begin_6hourly, end_6hourly, Gaussian))
-    int_vars.append(MetVar('SOILGEO', 'Z', 'e5.oper.invariant.128_129_z.regn320sc.2016010100_2016010100.nc', begin_monthly, end_monthly, Gaussian, isInvariant=True))
+
+    # For pressure-level ERA5/CDS-style workflows, use regular 0.25-degree
+    # lat/lon surface pressure and invariant surface geopotential. This is
+    # closer to the ECMWF GRIB pressure-level/single-level workflow. For
+    # model-level mode, keep the Gaussian/native-grid fields needed by the
+    # model-level pressure/GHT diagnostic.
+    if args.isobaric:
+        int_vars.append(MetVar('PSFC', 'SP',
+            'e5.oper.an.sfc.128_134_sp.ll025sc.{}_{}.nc',
+            begin_monthly, end_monthly, LatLon))
+        int_vars.append(MetVar('SOILGEO', 'Z',
+            'e5.oper.invariant.128_129_z.ll025sc.1979010100_1979010100.nc',
+            begin_monthly, end_monthly, LatLon, isInvariant=True))
+    else:
+        int_vars.append(MetVar('PSFC', 'SP',
+            'e5.oper.an.ml.128_134_sp.regn320sc.{}_{}.nc',
+            begin_6hourly, end_6hourly, Gaussian))
+        int_vars.append(MetVar('SOILGEO', 'Z',
+            'e5.oper.invariant.128_129_z.regn320sc.2016010100_2016010100.nc',
+            begin_monthly, end_monthly, Gaussian, isInvariant=True))
 
     # WPS variable names in dont_output cause the corresponding field to not be
     #   written to the output intermediate file. This is useful when fields are
@@ -620,6 +756,10 @@ if __name__ == '__main__':
     dont_output.append('DEWPT')    # Only used to diagnose RH
     dont_output.append('SNOW_EC')  # Only used in diagnosing SNOW and SNOWH
     dont_output.append('SNOW_DEN') # Only used in diagnosing SNOW and SNOWH
+    if args.isobaric:
+        # Direct ERA5 RH is read, but not written raw. DirectRHToLiquidDiags
+        # writes the adjusted RH field after matching it with TT.
+        dont_output.append('RH')
 
     if args.path != None:
         paths = [ add_trailing_slash(p) for p in args.path.split(',') ]
@@ -650,7 +790,11 @@ if __name__ == '__main__':
         initdate = datetime_to_string(currDate)
         print('Processing time record ' + initdate)
 
-        intfile = WPSUtils.IntermediateFile('ERA5', initdate)
+        intfile = WPSUtils.IntermediateFile(output_prefix, initdate)
+
+        # Cache the source-grid land/sea mask for optional masking of
+        # land-only and water-only surface fields during this time record.
+        landsea_slab = None
 
         for v in int_vars:
 
@@ -666,7 +810,15 @@ if __name__ == '__main__':
 
             idx = find_time_index(e5filename, initdate)
             if idx == -1:
-                idx = 0
+                if v.isInvariant:
+                    first_record = 0
+                    idx = first_record
+                else:
+                    print('Error: requested time ' + initdate +
+                          ' was not found in file:')
+                    print(e5filename)
+                    intfile.close()
+                    sys.exit(1)
             proj = v.mapProj
 
             print(e5filename)
@@ -679,7 +831,23 @@ if __name__ == '__main__':
                 field_arr = f.variables[v.ERA5name][idx,:]
 
                 if field_arr.ndim == 2:
-                    slab = field_arr
+                    slab = np.ma.asarray(field_arr)
+
+                    if v.WPSname == 'LANDSEA':
+                        # ERA5 LSM is fractional. Some GRIB/ungrib workflows keep
+                        # it fractional; others effectively use a binary 0/1 mask.
+                        # Use --binary-landsea only when the reference GRIB-derived
+                        # met_em LANDSEA is binary.
+                        if args.binary_landsea:
+                            slab = np.ma.where(slab >= 0.5, 1.0, 0.0)
+                        landsea_slab = slab.copy()
+
+                    if landsea_slab is not None:
+                        if v.WPSname in LAND_ONLY_FIELDS:
+                            slab = np.ma.masked_where(landsea_slab < 0.5, slab)
+                        elif v.WPSname in WATER_ONLY_FIELDS:
+                            slab = np.ma.masked_where(landsea_slab >= 0.5, slab)
+
                     xlvl = 200100.0
 
                     # There are some special cases in which 2-d fields are not
@@ -699,14 +867,25 @@ if __name__ == '__main__':
                     for diag in diagnostics:
                         diag.consider(v.WPSname, xlvl, proj, hdate, slab, intfile)
                 else:
-                    for k in range(f.dimensions['level'].size):
-                        slab = field_arr[k,:,:]
+                    if args.isobaric:
+                        levels = np.asarray(f.variables['level'][:], dtype=float)
+                        if args.level_order == 'bottom_to_top':
+                            level_indices = np.argsort(levels)[::-1]  # 1000 hPa -> 1 hPa
+                        elif args.level_order == 'top_to_bottom':
+                            level_indices = np.argsort(levels)        # 1 hPa -> 1000 hPa
+                        else:
+                            level_indices = range(f.dimensions['level'].size)
+                    else:
+                        level_indices = range(f.dimensions['level'].size)
+
+                    for k in level_indices:
+                        slab = np.ma.asarray(field_arr[k,:,:])
 
                         # For isobaric levels, the WPS intermediate file xlvl
                         # value should be in Pa, while the ERA5 netCDF files
                         # provide units of hPa
                         if args.isobaric:
-                            xlvl = f.variables['level'][k] * 100.0    # Convert hPa to Pa
+                            xlvl = float(f.variables['level'][k]) * 100.0    # Convert hPa to Pa
                         else:
                             xlvl = float(f.variables['level'][k])     # Level index
 
